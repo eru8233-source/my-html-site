@@ -1266,8 +1266,12 @@ var SUPABASE_ENABLED = false;
     if(SUPABASE_URL && SUPABASE_ANON_KEY && typeof window !== "undefined" && window.supabase && window.supabase.createClient){
       sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
       SUPABASE_ENABLED = true;
+      console.log("[Supabase] クライアントを初期化しました。URL:", SUPABASE_URL);
+    } else {
+      console.log("[Supabase] 未設定またはSDK未読み込みのため、ゲストモードで動作します。",
+        "URL設定:", !!SUPABASE_URL, "KEY設定:", !!SUPABASE_ANON_KEY, "SDK読み込み:", typeof window !== "undefined" && !!window.supabase);
     }
-  }catch(e){ SUPABASE_ENABLED = false; }
+  }catch(e){ SUPABASE_ENABLED = false; console.error("[Supabase] 初期化エラー:", e); }
 })();
 
 var currentUser = null;      // ログイン中のSupabase Authユーザー（未ログインならnull＝ゲスト）
@@ -1293,8 +1297,17 @@ function showSyncToast(msg, isError){
     el.textContent = msg;
     el.style.opacity = "1";
     if(syncToastTimer) clearTimeout(syncToastTimer);
-    syncToastTimer = setTimeout(function(){ el.style.opacity = "0"; }, 3500);
+    syncToastTimer = setTimeout(function(){ el.style.opacity = "0"; }, 6000);
   }catch(e){}
+}
+
+// 同期エラーの詳細をコンソールへ出力し、トーストにも実際のエラー内容を短く表示する。
+// （原因調査のため、ブラウザのDevTools「コンソール」タブで [Supabase同期エラー] を検索すると詳細が見られる）
+function reportSyncError(context, error){
+  try{ console.error("[Supabase同期エラー] " + context, error); }catch(e){}
+  var detail = (error && (error.message || error.error_description || error.hint || error.details)) || "";
+  var short = detail ? (detail.length > 60 ? detail.slice(0,60)+"…" : detail) : "詳細はコンソールを確認してください";
+  showSyncToast("保存に失敗しました（" + context + "）：" + short, true);
 }
 
 function translateAuthError(err){
@@ -1369,8 +1382,9 @@ function syncQuestionProgress(questionId, patch){
       if(patch.last_status !== undefined) row.last_status = patch.last_status;
       return sbClient.from("question_progress").upsert(row, {onConflict:"user_id,question_id"});
     }).then(function(res){
-      if(res && res.error) showSyncToast("保存に失敗しました（間違えた問題）。", true);
-    }).catch(function(){ showSyncToast("保存に失敗しました（通信エラー）。", true); });
+      if(res && res.error) reportSyncError("間違えた問題", res.error);
+      else console.log("[Supabase] question_progress 保存成功:", questionId);
+    }).catch(function(err0){ reportSyncError("通信エラー", err0); });
 }
 
 function syncBlockAttempt(blockId, attempt){
@@ -1383,15 +1397,15 @@ function syncBlockAttempt(blockId, attempt){
     average_answer_time: attempt.answered>0 ? attempt.totalTime/attempt.answered : null,
     start_difficulty: attempt.startDifficulty, final_difficulty: attempt.finalDifficulty,
     completed_at: attempt.completedAt
-  }).then(function(res){ if(res.error) showSyncToast("保存に失敗しました（ブロック履歴）。", true); })
-    .catch(function(){ showSyncToast("保存に失敗しました（通信エラー）。", true); });
+  }).then(function(res){ if(res.error) reportSyncError("ブロック履歴", res.error); })
+    .catch(function(err0){ reportSyncError("通信エラー", err0); });
 
   sbClient.from("block_progress").upsert({
     user_id: currentUserId(), block_id: blockId, subject: block?block.subject:null, section: block?block.category:null,
     block_number: block?block.blockNumber:null, status: "completed", answered_count: attempt.answered,
     last_attempt_at: attempt.completedAt
   }, {onConflict:"user_id,block_id"}).then(function(res){
-    if(res.error) showSyncToast("保存に失敗しました（ブロック進捗）。", true);
+    if(res.error) reportSyncError("ブロック進捗", res.error);
   }).catch(function(){});
 }
 
@@ -1402,8 +1416,8 @@ function syncLangEval(rec){
     long_reading_count: rec.longReadingCount, checkbox_count: rec.checkboxCount,
     extraction_count: rec.extractionCount, extraction_with_limit_count: rec.extractionWithLimitCount,
     extraction_without_limit_count: rec.extractionWithoutLimitCount, completed_at: rec.completedAt
-  }).then(function(res){ if(res.error) showSyncToast("保存に失敗しました（言語評価）。", true); })
-    .catch(function(){ showSyncToast("保存に失敗しました（通信エラー）。", true); });
+  }).then(function(res){ if(res.error) reportSyncError("言語評価", res.error); })
+    .catch(function(err0){ reportSyncError("通信エラー", err0); });
 }
 
 function syncNonverbalEval(rec){
@@ -1415,8 +1429,8 @@ function syncNonverbalEval(rec){
     multi_question_correct_count: rec.multiCorrect, multi_question_answer_count: rec.multiAnswered,
     four_tab_correct_count: rec.fourTabCorrect, four_tab_answer_count: rec.fourTabAnswered,
     completed_at: rec.completedAt
-  }).then(function(res){ if(res.error) showSyncToast("保存に失敗しました（非言語評価）。", true); })
-    .catch(function(){ showSyncToast("保存に失敗しました（通信エラー）。", true); });
+  }).then(function(res){ if(res.error) reportSyncError("非言語評価", res.error); })
+    .catch(function(err0){ reportSyncError("通信エラー", err0); });
 }
 
 // テスト結果（test_attempts）＋問題ごとの回答（test_answers）をまとめて保存する。
@@ -1435,7 +1449,7 @@ function syncTestSession(subjectName, mode, cfg, t){
     aborted_at: (t.status === "aborted") ? new Date(t.testEndTime).toISOString() : null
   };
   sbClient.from("test_attempts").insert(row).select().single().then(function(res){
-    if(res.error){ showSyncToast("保存に失敗しました（テスト結果）。", true); return; }
+    if(res.error){ reportSyncError("テスト結果", res.error); return; }
     var testId = res.data.id;
     if(!t.questionRecords || !t.questionRecords.length) return;
     var answerRows = t.questionRecords.map(function(r){
@@ -1447,9 +1461,9 @@ function syncTestSession(subjectName, mode, cfg, t){
       };
     });
     sbClient.from("test_answers").insert(answerRows).then(function(res2){
-      if(res2.error) showSyncToast("保存に失敗しました（回答履歴）。", true);
+      if(res2.error) reportSyncError("回答履歴", res2.error);
     }).catch(function(){});
-  }).catch(function(){ showSyncToast("保存に失敗しました（通信エラー）。", true); });
+  }).catch(function(err0){ reportSyncError("通信エラー", err0); });
 }
 
 // ---- ログイン時：ゲストデータ(localStorage)をユーザーのSupabaseデータへ統合する ----
