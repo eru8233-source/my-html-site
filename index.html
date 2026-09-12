@@ -1351,7 +1351,7 @@ function authSignUp(email, password, onDone){
   sbClient.auth.signUp({email:email, password:password}).then(function(res){
     if(res.error){ onDone(translateAuthError(res.error)); return; }
     onDone(null, res.data);
-  }).catch(function(){ onDone("通信エラーが発生しました。ネットワーク接続を確認してください。"); });
+  }).catch(function(err){ console.error("[Supabase] signUp失敗:", err); onDone("通信エラーが発生しました（詳細はコンソールを確認）：" + (err&&err.message?err.message:err)); });
 }
 function authSignIn(email, password, onDone){
   if(!SUPABASE_ENABLED){ onDone("Supabaseが設定されていません（管理者に設定を依頼してください）。"); return; }
@@ -1359,26 +1359,26 @@ function authSignIn(email, password, onDone){
     if(res.error){ onDone(translateAuthError(res.error)); return; }
     currentUser = res.data.user;
     onDone(null);
-  }).catch(function(){ onDone("通信エラーが発生しました。ネットワーク接続を確認してください。"); });
+  }).catch(function(err){ console.error("[Supabase] signIn失敗:", err); onDone("通信エラーが発生しました（詳細はコンソールを確認）：" + (err&&err.message?err.message:err)); });
 }
 function authSignOut(onDone){
   if(!SUPABASE_ENABLED){ currentUser = null; if(onDone) onDone(); return; }
   sbClient.auth.signOut().then(function(){ currentUser = null; if(onDone) onDone(); })
-    .catch(function(){ currentUser = null; if(onDone) onDone(); });
+    .catch(function(err){ console.error("[Supabase] signOut失敗:", err); currentUser = null; if(onDone) onDone(); });
 }
 function authSignInWithGoogle(onDone){
   if(!SUPABASE_ENABLED){ onDone("Supabaseが設定されていません（管理者に設定を依頼してください）。"); return; }
   sbClient.auth.signInWithOAuth({provider:"google", options:{redirectTo: window.location.href}}).then(function(res){
     if(res.error){ onDone(translateAuthError(res.error)); return; }
     // 成功時はGoogleの認証画面へブラウザごと遷移するため、ここに制御は戻らない。
-  }).catch(function(){ onDone("通信エラーが発生しました。ネットワーク接続を確認してください。"); });
+  }).catch(function(err){ console.error("[Supabase] Googleログイン失敗:", err); onDone("通信エラーが発生しました（詳細はコンソールを確認）：" + (err&&err.message?err.message:err)); });
 }
 function authResetPassword(email, onDone){
   if(!SUPABASE_ENABLED){ onDone("Supabaseが設定されていません。"); return; }
   sbClient.auth.resetPasswordForEmail(email).then(function(res){
     if(res.error){ onDone(translateAuthError(res.error)); return; }
     onDone(null);
-  }).catch(function(){ onDone("通信エラーが発生しました。"); });
+  }).catch(function(err){ console.error("[Supabase] resetPassword失敗:", err); onDone("通信エラーが発生しました（詳細はコンソールを確認）：" + (err&&err.message?err.message:err)); });
 }
 
 // ---- データ同期（fire-and-forgetでSupabaseへミラー保存。失敗してもローカルの学習は継続できる）----
@@ -1514,7 +1514,19 @@ function migrateGuestDataToSupabase(onDone){
     );
   });
 
-  Promise.all(tasks.map(function(p){ return p.catch(function(){ return null; }); })).then(function(){ onDone(); }).catch(onDone);
+  var migrateErrors = [];
+  Promise.all(tasks.map(function(p){
+    return p.then(function(res){
+      if(res && res.error) migrateErrors.push(res.error);
+      return res;
+    }).catch(function(err){ migrateErrors.push(err); return null; });
+  })).then(function(){
+    if(migrateErrors.length){
+      console.error("[Supabase] ゲストデータの移行に失敗した項目があります:", migrateErrors);
+      showSyncToast("一部のデータの移行に失敗しました（詳細はコンソールを確認）。", true);
+    }
+    onDone();
+  }).catch(function(err){ console.error("[Supabase] ゲストデータ移行処理全体でエラー:", err); onDone(); });
 }
 
 // ---- ログイン直後：Supabase側のデータをローカルの表示用マップへ反映する（簡易プル）----
@@ -1522,7 +1534,14 @@ function pullUserDataFromSupabase(onDone){
   if(!SUPABASE_ENABLED || !isLoggedIn()){ onDone(); return; }
   sbClient.from("question_progress").select("question_id,is_weak,last_status").eq("user_id", currentUserId())
     .then(function(res){
+      if(res && res.error){
+        console.error("[Supabase] question_progressの取得に失敗しました:", res.error);
+        showSyncToast("保存済みデータの取得に失敗しました（詳細はコンソールを確認）：" + res.error.message, true);
+        onDone();
+        return;
+      }
       if(res && res.data){
+        console.log("[Supabase] question_progress取得件数:", res.data.length);
         res.data.forEach(function(row){
           if(row.is_weak) weakMap[row.question_id] = true;
           if(row.last_status) statusMap[row.question_id] = row.last_status;
@@ -1531,7 +1550,11 @@ function pullUserDataFromSupabase(onDone){
         saveStatus(statusMap);
       }
       onDone();
-    }).catch(function(){ onDone(); });
+    }).catch(function(err){
+      console.error("[Supabase] question_progressの取得で通信エラー:", err);
+      showSyncToast("保存済みデータの取得で通信エラーが発生しました（詳細はコンソールを確認）。", true);
+      onDone();
+    });
 }
 
 
