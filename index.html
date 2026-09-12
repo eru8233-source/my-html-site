@@ -94,7 +94,7 @@
 </head>
 <body>
 <div class="wrap" id="app"></div>
-<footer>学習アプリ ver.1（正解・解説データは今後の追加待ちの問題を含みます）</footer>
+<footer>SPI学習アプリ</footer>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
@@ -639,7 +639,7 @@ function estimateDifficulty(q){
     case "対義語・類推": base = 1; break;
     case "穴埋め": base = 2; break;
     case "語句": base = 3; break;
-    case "文整序": base = 4; break;
+    case "文整序": base = 5; break;
     case "読解": base = 4; break; // 長文が出現する水準を基本ラインとする
     default: base = 3;
   }
@@ -1165,6 +1165,30 @@ NV(6139, "推論", "つぎの説明を読んで，各問いに答えなさい。
 if(typeof NONVERBAL_QUESTIONS !== "undefined"){
   Array.prototype.push.apply(QUESTIONS, NONVERBAL_QUESTIONS);
 }
+
+// ---------- 非言語「推論」系カテゴリーの難易度を引き上げ ----------
+// 「推論」「推論（曜日）」など、カテゴリー名に「推論」を含む非言語問題の難易度を+2する
+// （出題ロジック上の難易度値のみの調整。問題内容・カテゴリー分類・その他仕様は変更しない）
+(function boostNonverbalReasoningDifficulty(){
+  QUESTIONS.forEach(function(q){
+    if(q.subject === "nonverbal" && q.category && q.category.indexOf("推論") !== -1){
+      q.difficulty = Math.min(7, q.difficulty + 2);
+    }
+  });
+  // 組問題の代表難易度(setDifficulty)を、引き上げ後の値で再計算する
+  QUESTIONS.forEach(function(q){
+    if(q.subject !== "nonverbal") return;
+    if(q.questionSetId){
+      var first = null;
+      for(var i=0;i<QUESTIONS.length;i++){
+        if(QUESTIONS[i].questionSetId===q.questionSetId && QUESTIONS[i].questionSetPosition===1){ first = QUESTIONS[i]; break; }
+      }
+      q.setDifficulty = first ? first.difficulty : q.difficulty;
+    } else {
+      q.setDifficulty = q.difficulty;
+    }
+  });
+})();
 
 // ---------- ブロック情報の再計算（科目×カテゴリー単位、20問区切り、組問題は分断しない） ----------
 (function(){
@@ -3226,12 +3250,16 @@ function beginTestQuestion(qid){
 // 組問題のチャンク（difficultyは setDifficulty を使用）を目標difficultyに近い順に並べる
 // 言語のみ：開始直後(難易度が低いあたり)は語彙・二語関係・空欄補充などを優先し、
 // 難易度が上がるほど読解（長文）を優先しやすくする参考バイアス。非言語には適用しない。
-var LANG_STANDARD_CATEGORIES = {"対義語・類推":1,"語句":1,"穴埋め":1,"文整序":1};
+var LANG_STANDARD_CATEGORIES = {"対義語・類推":1,"語句":1,"穴埋め":1};
 function languageCategoryBias(category, target){
   if(category === "読解"){
     if(target <= 4) return 1.5;   // 低難度帯では読解を少し遠ざける
     if(target === 5) return 0;
     return -1.5;                  // 高難度帯では読解を優先しやすくする
+  }
+  if(category === "文整序"){
+    if(target <= 4) return 1.0;   // 長文ほどではないが、開始直後はやや出にくくする
+    return 0;
   }
   if(LANG_STANDARD_CATEGORIES[category]){
     if(target <= 4) return -0.5;  // 低難度帯では語彙・二語関係系をわずかに優先
