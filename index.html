@@ -1837,6 +1837,122 @@ function createFlashcardFromQuestion(q, folderId){
   return addFlashcard(front, back, "", sourceType, q.problemSource, q.id, folderId || null);
 }
 
+// ============================================================
+// お知らせ（管理人メモ）・今週のおすすめ（YouTube）・管理者機能
+// ============================================================
+var LS_ANNOUNCEMENTS_CACHE = "jq_announcements_cache_v1";
+var LS_FEATURED_VIDEO_CACHE = "jq_featured_video_cache_v1";
+function loadAnnouncementsCache(){ try{ return JSON.parse(localStorage.getItem(LS_ANNOUNCEMENTS_CACHE)||"[]"); }catch(e){ return []; } }
+function saveAnnouncementsCache(arr){ try{ localStorage.setItem(LS_ANNOUNCEMENTS_CACHE, JSON.stringify(arr)); }catch(e){} }
+function loadFeaturedVideoCache(){ try{ return JSON.parse(localStorage.getItem(LS_FEATURED_VIDEO_CACHE)||"null"); }catch(e){ return null; } }
+function saveFeaturedVideoCache(v){ try{ localStorage.setItem(LS_FEATURED_VIDEO_CACHE, JSON.stringify(v)); }catch(e){} }
+
+var announcementsList = loadAnnouncementsCache();   // [{id, body, postedAt, displayOrder, isPublished}]
+var featuredVideo = loadFeaturedVideoCache();        // {id, youtubeUrl, comment} | null
+var currentUserIsAdmin = false;
+
+// オンラインで取得できたときだけキャッシュを更新する。取得に失敗しても、
+// 前回キャッシュされた内容（announcementsList/featuredVideo の初期値）がそのまま画面に使われる。
+function fetchAnnouncements(onDone){
+  if(!SUPABASE_ENABLED){ onDone(); return; }
+  sbClient.from("announcements").select("id,body,posted_at,display_order")
+    .eq("is_published", true)
+    .order("display_order", {ascending:true}).order("posted_at", {ascending:false})
+    .then(function(res){
+      if(res && res.error){ console.error("[お知らせ] 取得エラー:", res.error); onDone(); return; }
+      announcementsList = (res && res.data || []).map(function(r){
+        return {id:r.id, body:r.body, postedAt:r.posted_at, displayOrder:r.display_order};
+      });
+      saveAnnouncementsCache(announcementsList);
+      onDone();
+    }).catch(function(err){ console.error("[お知らせ] 通信エラー:", err); onDone(); });
+}
+function fetchFeaturedVideo(onDone){
+  if(!SUPABASE_ENABLED){ onDone(); return; }
+  sbClient.from("featured_video").select("id,youtube_url,comment")
+    .eq("is_published", true).order("updated_at", {ascending:false}).limit(1).maybeSingle()
+    .then(function(res){
+      if(res && res.error){ console.error("[おすすめ動画] 取得エラー:", res.error); onDone(); return; }
+      featuredVideo = (res && res.data) ? {id:res.data.id, youtubeUrl:res.data.youtube_url, comment:res.data.comment} : null;
+      saveFeaturedVideoCache(featuredVideo);
+      onDone();
+    }).catch(function(err){ console.error("[おすすめ動画] 通信エラー:", err); onDone(); });
+}
+function checkAdminStatus(onDone){
+  if(!SUPABASE_ENABLED || !isLoggedIn()){ currentUserIsAdmin = false; onDone(); return; }
+  sbClient.from("profiles").select("is_admin").eq("id", currentUserId()).maybeSingle()
+    .then(function(res){
+      currentUserIsAdmin = !!(res && res.data && res.data.is_admin);
+      onDone();
+    }).catch(function(){ currentUserIsAdmin = false; onDone(); });
+}
+
+// YouTubeの各種URL形式から動画IDを抽出する（watch?v=, youtu.be/, embed/, shorts/ に対応）
+function extractYoutubeId(url){
+  if(!url) return null;
+  var m = String(url).match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{6,})/);
+  return m ? m[1] : null;
+}
+
+// ---- 管理者操作（すべてSupabase側のRLSでも管理者チェックされるため、なりすまし不可） ----
+function adminCreateAnnouncement(body, isPublished, onDone){
+  if(!SUPABASE_ENABLED || !currentUserIsAdmin){ onDone("権限がありません。"); return; }
+  var minOrder = 0;
+  sbClient.from("announcements").select("display_order").order("display_order",{ascending:true}).limit(1).maybeSingle()
+    .then(function(res){
+      if(res && res.data) minOrder = res.data.display_order - 1;
+      return sbClient.from("announcements").insert({
+        body: body, is_published: isPublished, posted_at: new Date().toISOString(), display_order: minOrder
+      });
+    }).then(function(res){
+      if(res && res.error){ onDone(translateSupabaseError(res.error)); return; }
+      onDone(null);
+    }).catch(function(err){ onDone(translateSupabaseError(err)); });
+}
+function adminUpdateAnnouncement(id, patch, onDone){
+  if(!SUPABASE_ENABLED || !currentUserIsAdmin){ onDone("権限がありません。"); return; }
+  sbClient.from("announcements").update(patch).eq("id", id).then(function(res){
+    if(res && res.error){ onDone(translateSupabaseError(res.error)); return; }
+    onDone(null);
+  }).catch(function(err){ onDone(translateSupabaseError(err)); });
+}
+function adminDeleteAnnouncement(id, onDone){
+  if(!SUPABASE_ENABLED || !currentUserIsAdmin){ onDone("権限がありません。"); return; }
+  sbClient.from("announcements").delete().eq("id", id).then(function(res){
+    if(res && res.error){ onDone(translateSupabaseError(res.error)); return; }
+    onDone(null);
+  }).catch(function(err){ onDone(translateSupabaseError(err)); });
+}
+function adminFetchAllAnnouncements(onDone){
+  if(!SUPABASE_ENABLED || !currentUserIsAdmin){ onDone([]); return; }
+  sbClient.from("announcements").select("*").order("display_order",{ascending:true}).order("posted_at",{ascending:false})
+    .then(function(res){ onDone((res && res.data) || []); })
+    .catch(function(){ onDone([]); });
+}
+function adminSetFeaturedVideo(youtubeUrl, comment, isPublished, onDone){
+  if(!SUPABASE_ENABLED || !currentUserIsAdmin){ onDone("権限がありません。"); return; }
+  // 新しい動画を登録したら、既存の公開中の動画は自動的に非公開にする
+  sbClient.from("featured_video").update({is_published:false}).eq("is_published", true)
+    .then(function(){
+      return sbClient.from("featured_video").insert({
+        youtube_url: youtubeUrl, comment: comment, is_published: isPublished, updated_at: new Date().toISOString()
+      });
+    }).then(function(res){
+      if(res && res.error){ onDone(translateSupabaseError(res.error)); return; }
+      onDone(null);
+    }).catch(function(err){ onDone(translateSupabaseError(err)); });
+}
+function adminFetchCurrentFeaturedVideo(onDone){
+  if(!SUPABASE_ENABLED || !currentUserIsAdmin){ onDone(null); return; }
+  sbClient.from("featured_video").select("*").order("updated_at",{ascending:false}).limit(1).maybeSingle()
+    .then(function(res){ onDone((res && res.data) || null); })
+    .catch(function(){ onDone(null); });
+}
+function translateSupabaseError(err){
+  var msg = (err && err.message) || String(err || "");
+  return msg || "エラーが発生しました。";
+}
+
 function translateAuthError(err){
   var msg = (err && err.message) || String(err || "");
   if(/already registered|already exists|User already registered/i.test(msg)) return "このメールアドレスは既に登録されています。";
@@ -1865,9 +1981,9 @@ function authSignIn(email, password, onDone){
   }).catch(function(err){ console.error("[Supabase] signIn失敗:", err); onDone("通信エラーが発生しました（詳細はコンソールを確認）：" + (err&&err.message?err.message:err)); });
 }
 function authSignOut(onDone){
-  if(!SUPABASE_ENABLED){ currentUser = null; if(onDone) onDone(); return; }
-  sbClient.auth.signOut().then(function(){ currentUser = null; if(onDone) onDone(); })
-    .catch(function(err){ console.error("[Supabase] signOut失敗:", err); currentUser = null; if(onDone) onDone(); });
+  if(!SUPABASE_ENABLED){ currentUser = null; currentUserIsAdmin = false; if(onDone) onDone(); return; }
+  sbClient.auth.signOut().then(function(){ currentUser = null; currentUserIsAdmin = false; if(onDone) onDone(); })
+    .catch(function(err){ console.error("[Supabase] signOut失敗:", err); currentUser = null; currentUserIsAdmin = false; if(onDone) onDone(); });
 }
 function authSignInWithGoogle(onDone){
   if(!SUPABASE_ENABLED){ onDone("Supabaseが設定されていません（管理者に設定を依頼してください）。"); return; }
@@ -2434,7 +2550,8 @@ var state = {
   showAbortMenu: false, // テスト中断の確認パネル表示中かどうか
   pendingSourceLabel: null, pendingSourceCallback: null, // 旧問題/参考問題/すべて 選択待ち
   currentFlashcardFolder: null, flashcardEditFolder: null, flashcardStudy: null,
-  showQuizAbortMenu: false // 学習モードの「中断してトップへ」確認パネル表示中かどうか
+  showQuizAbortMenu: false, // 学習モードの「中断してトップへ」確認パネル表示中かどうか
+  adminEditAnnouncementId: null
 };
 
 var app = document.getElementById("app");
@@ -2504,9 +2621,11 @@ function renderLogin(){
       migrateGuestDataToSupabase(function(){
         pullUserDataFromSupabase(function(){
           syncFlashcardsOnLogin(function(){
-            pendingDataPull = false;
-            showSyncToast("ログインしました。");
-            go("home");
+            checkAdminStatus(function(){
+              pendingDataPull = false;
+              showSyncToast("ログインしました。");
+              go("home");
+            });
           });
         });
       });
@@ -2554,8 +2673,10 @@ function renderSignup(){
       migrateGuestDataToSupabase(function(){
         pullUserDataFromSupabase(function(){
           syncFlashcardsOnLogin(function(){
-            showSyncToast("登録が完了しました。");
-            go("home");
+            checkAdminStatus(function(){
+              showSyncToast("登録が完了しました。");
+              go("home");
+            });
           });
         });
       });
@@ -2615,6 +2736,39 @@ function renderHome(){
   }
   accountBarHtml += '</div>';
 
+  // 📢 管理人メモ
+  var announceHtml = "";
+  if(announcementsList && announcementsList.length){
+    announceHtml = '<div class="card" style="background:#fffaf0;border-color:#e8c37a;">' +
+      '<div style="font-weight:700;margin-bottom:8px;">📢 管理人メモ</div>';
+    announcementsList.slice(0, 5).forEach(function(a, idx){
+      if(idx > 0) announceHtml += '<div style="border-top:1px dashed var(--line);margin:12px 0;"></div>';
+      announceHtml += '<div style="white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.7;">' + escapeHtml(a.body) + '</div>';
+    });
+    announceHtml += '</div>';
+  }
+
+  // 🎵 今週のおすすめ
+  var videoHtml = "";
+  if(featuredVideo && featuredVideo.youtubeUrl){
+    var vid = extractYoutubeId(featuredVideo.youtubeUrl);
+    videoHtml = '<div class="card">' + '<div style="font-weight:700;margin-bottom:10px;">🎵 今週のおすすめ</div>';
+    if(vid){
+      videoHtml += '<div style="position:relative;width:100%;padding-top:56.25%;border-radius:10px;overflow:hidden;background:#000;">' +
+        '<iframe src="https://www.youtube.com/embed/' + vid + '" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" ' +
+        'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen loading="lazy"></iframe></div>';
+    }
+    videoHtml += '<div style="margin-top:8px;"><a href="' + escapeHtml(featuredVideo.youtubeUrl) + '" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-size:13px;">YouTubeで見る</a></div>';
+    if(featuredVideo.comment){
+      videoHtml += '<div style="margin-top:8px;font-size:14px;white-space:pre-wrap;word-break:break-word;">' + escapeHtml(featuredVideo.comment) + '</div>';
+    }
+    videoHtml += '</div>';
+  }
+
+  var adminLinkHtml = currentUserIsAdmin
+    ? '<div style="text-align:center;margin-top:6px;"><span id="b-admin-menu" style="color:var(--sub);font-size:12px;cursor:pointer;">⚙️ 管理者メニュー</span></div>'
+    : '';
+
   app.innerHTML =
     accountBarHtml +
     '<h1>SPI学習アプリ</h1>' +
@@ -2623,11 +2777,16 @@ function renderHome(){
     '<button class="btn primary" id="b-subj-language">言語<span class="meta">言語問題を学習・テストします（全' + langCount + '問）</span></button>' +
     '<button class="btn primary" id="b-subj-nonverbal">非言語<span class="meta">非言語問題を学習・テストします（全' + nvCount + '問）</span></button>' +
     '<button class="btn" id="b-subj-combined" style="border-color:var(--accent);">言語＋非言語<span class="meta">言語→非言語の順で行う総合テストです</span></button>' +
-    '<div class="note" style="margin-top:14px;text-align:center;">※本アプリの出題順・難易度・評価は学習用に簡略化したものであり、実際のSPIの画面・アルゴリズム・採点を再現するものではありません。</div>';
+    announceHtml +
+    videoHtml +
+    '<div class="note" style="margin-top:14px;text-align:center;">※本アプリの出題順・難易度・評価は学習用に簡略化したものであり、実際のSPIの画面・アルゴリズム・採点を再現するものではありません。</div>' +
+    adminLinkHtml;
 
   document.getElementById("b-subj-language").onclick = function(){ state.subject = "language"; go("top"); };
   document.getElementById("b-subj-nonverbal").onclick = function(){ state.subject = "nonverbal"; go("top"); };
   document.getElementById("b-subj-combined").onclick = function(){ go("combinedSetup"); };
+  var adminMenuLink = document.getElementById("b-admin-menu");
+  if(adminMenuLink) adminMenuLink.onclick = function(){ go("adminHome"); };
 
   var resumeBtn = document.getElementById("b-resume-combined");
   if(resumeBtn){
@@ -3427,6 +3586,149 @@ function renderFlashcardStudy(){
   document.getElementById("b-fc-prev").onclick = function(){ if(s.idx>0){ s.idx--; s.showBack=false; renderFlashcardStudy(); } };
   document.getElementById("b-fc-next").onclick = function(){ s.idx++; s.showBack=false; renderFlashcardStudy(); };
   document.getElementById("b-fc-shuffle").onclick = function(){ s.ids = shuffle(s.ids); s.idx=0; s.showBack=false; renderFlashcardStudy(); };
+}
+
+// ============================================================
+// 管理者画面：お知らせ・今週のおすすめの管理
+// ============================================================
+function guardAdminScreen(){
+  if(!currentUserIsAdmin){ go("home"); return false; }
+  return true;
+}
+
+function renderAdminHome(){
+  if(!guardAdminScreen()) return;
+  app.innerHTML = '<h2>読み込み中…</h2>';
+  adminFetchAllAnnouncements(function(list){
+    adminFetchCurrentFeaturedVideo(function(video){
+      var html = '<div class="backlink" id="back">← ホームへ戻る</div><h2>⚙️ 管理者メニュー</h2>';
+
+      html += '<div class="card"><div style="font-weight:700;margin-bottom:10px;">📢 お知らせ</div>';
+      html += '<button class="btn primary" id="b-admin-new-announce">＋ 新しいお知らせを書く</button>';
+      if(!list.length){
+        html += '<div class="empty">まだお知らせがありません。</div>';
+      }
+      list.forEach(function(a){
+        html += '<div style="border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:10px;">' +
+          '<div style="font-size:12px;color:var(--sub);margin-bottom:6px;">' +
+          (a.is_published ? '<span style="color:var(--ok);font-weight:600;">公開中</span>' : '<span style="color:var(--sub);">非公開</span>') +
+          '　投稿日：' + new Date(a.posted_at).toLocaleDateString("ja-JP") + '</div>' +
+          '<div style="white-space:pre-wrap;font-size:14px;margin-bottom:8px;">' + escapeHtml(a.body) + '</div>' +
+          '<button class="btn ghost" data-edit-announce="' + escapeHtml(a.id) + '" style="margin-bottom:6px;">編集</button>' +
+          '<button class="btn ghost" data-del-announce="' + escapeHtml(a.id) + '" style="border-color:var(--ng);color:var(--ng);">削除</button>' +
+          '</div>';
+      });
+      html += '</div>';
+
+      html += '<div class="card"><div style="font-weight:700;margin-bottom:10px;">🎵 今週のおすすめ</div>';
+      if(video){
+        html += '<div style="font-size:13px;color:var(--sub);margin-bottom:6px;">' +
+          (video.is_published ? '<span style="color:var(--ok);font-weight:600;">公開中</span>' : '<span style="color:var(--sub);">非公開</span>') + '</div>' +
+          '<div style="font-size:14px;word-break:break-all;margin-bottom:6px;">' + escapeHtml(video.youtube_url) + '</div>' +
+          (video.comment ? '<div style="font-size:13px;color:var(--sub);margin-bottom:6px;">' + escapeHtml(video.comment) + '</div>' : '');
+      } else {
+        html += '<div class="empty">まだ登録されていません。</div>';
+      }
+      html += '<button class="btn primary" id="b-admin-edit-video">' + (video ? '動画を差し替える' : '動画を登録する') + '</button>';
+      html += '</div>';
+
+      app.innerHTML = html;
+      document.getElementById("back").onclick = function(){ go("home"); };
+      document.getElementById("b-admin-new-announce").onclick = function(){ state.adminEditAnnouncementId = null; go("adminAnnouncementEdit"); };
+      document.getElementById("b-admin-edit-video").onclick = function(){ go("adminVideoEdit"); };
+      Array.prototype.forEach.call(app.querySelectorAll("[data-edit-announce]"), function(btn){
+        btn.onclick = function(){ state.adminEditAnnouncementId = btn.getAttribute("data-edit-announce"); go("adminAnnouncementEdit"); };
+      });
+      Array.prototype.forEach.call(app.querySelectorAll("[data-del-announce]"), function(btn){
+        btn.onclick = function(){
+          if(!confirm("このお知らせを削除しますか？")) return;
+          adminDeleteAnnouncement(btn.getAttribute("data-del-announce"), function(err){
+            if(err){ showSyncToast("削除に失敗しました：" + err, true); return; }
+            showSyncToast("削除しました。");
+            renderAdminHome();
+          });
+        };
+      });
+    });
+  });
+}
+
+function renderAdminAnnouncementEdit(){
+  if(!guardAdminScreen()) return;
+  var editId = state.adminEditAnnouncementId;
+  var existing = null;
+  function renderForm(){
+    var html = '<div class="backlink" id="back">← 管理者メニューへ戻る</div>';
+    html += '<h2>' + (editId ? "お知らせを編集" : "新しいお知らせを書く") + '</h2>';
+    html += '<div class="card">' +
+      '<label style="font-size:13px;color:var(--sub);">本文（改行・絵文字OK）</label>' +
+      '<textarea id="announce-body" rows="8" style="width:100%;padding:12px;border-radius:10px;border:2px solid var(--line);font-size:15px;font-family:inherit;margin-top:6px;white-space:pre-wrap;">' +
+      escapeHtml(existing ? existing.body : "") + '</textarea>' +
+      '<label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-size:14px;">' +
+      '<input type="checkbox" id="announce-published" ' + (existing ? (existing.is_published?"checked":"") : "") + ' style="width:18px;height:18px;">公開する</label>' +
+      '<button class="btn primary" id="b-announce-save" style="margin-top:14px;">保存する</button>' +
+      '</div>';
+    app.innerHTML = html;
+    document.getElementById("back").onclick = function(){ go("adminHome"); };
+    document.getElementById("b-announce-save").onclick = function(){
+      var body = document.getElementById("announce-body").value;
+      var published = document.getElementById("announce-published").checked;
+      if(!body.trim()){ alert("本文を入力してください。"); return; }
+      var btn = document.getElementById("b-announce-save");
+      btn.setAttribute("disabled","disabled"); btn.textContent = "保存中…";
+      function done(err){
+        if(err){ showSyncToast("保存に失敗しました：" + err, true); btn.removeAttribute("disabled"); btn.textContent = "保存する"; return; }
+        showSyncToast("保存しました。");
+        fetchAnnouncements(function(){ go("adminHome"); });
+      }
+      if(editId){ adminUpdateAnnouncement(editId, {body:body, is_published:published}, done); }
+      else { adminCreateAnnouncement(body, published, done); }
+    };
+  }
+  if(editId){
+    adminFetchAllAnnouncements(function(list){
+      existing = list.filter(function(a){ return a.id === editId; })[0] || null;
+      renderForm();
+    });
+  } else {
+    renderForm();
+  }
+}
+
+function renderAdminVideoEdit(){
+  if(!guardAdminScreen()) return;
+  app.innerHTML = '<h2>読み込み中…</h2>';
+  adminFetchCurrentFeaturedVideo(function(video){
+    var html = '<div class="backlink" id="back">← 管理者メニューへ戻る</div><h2>🎵 今週のおすすめを設定</h2>';
+    html += '<div class="card">' +
+      '<label style="font-size:13px;color:var(--sub);">YouTube URL</label>' +
+      '<input type="text" id="video-url" placeholder="https://www.youtube.com/watch?v=XXXXXXXX" value="' + escapeHtml(video ? video.youtube_url : "") + '" ' +
+      'style="width:100%;padding:12px;border-radius:10px;border:2px solid var(--line);font-size:15px;margin-top:6px;">' +
+      '<label style="font-size:13px;color:var(--sub);margin-top:14px;display:block;">管理人コメント（任意）</label>' +
+      '<textarea id="video-comment" rows="3" style="width:100%;padding:12px;border-radius:10px;border:2px solid var(--line);font-size:14px;font-family:inherit;margin-top:6px;">' +
+      escapeHtml(video && video.comment ? video.comment : "") + '</textarea>' +
+      '<label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-size:14px;">' +
+      '<input type="checkbox" id="video-published" ' + (video && video.is_published ? "checked" : "") + ' style="width:18px;height:18px;">公開する</label>' +
+      '<div class="note" style="margin-top:8px;">保存すると新しい動画として登録され、以前の動画は自動的に非公開になります。</div>' +
+      '<button class="btn primary" id="b-video-save" style="margin-top:14px;">保存する</button>' +
+      '</div>';
+    app.innerHTML = html;
+    document.getElementById("back").onclick = function(){ go("adminHome"); };
+    document.getElementById("b-video-save").onclick = function(){
+      var url = document.getElementById("video-url").value.trim();
+      var comment = document.getElementById("video-comment").value.trim();
+      var published = document.getElementById("video-published").checked;
+      if(!url){ alert("YouTube URLを入力してください。"); return; }
+      if(!extractYoutubeId(url)){ if(!confirm("YouTubeの動画URLとして認識できませんでした。このまま保存しますか？（埋め込みが表示されない場合があります）")) return; }
+      var btn = document.getElementById("b-video-save");
+      btn.setAttribute("disabled","disabled"); btn.textContent = "保存中…";
+      adminSetFeaturedVideo(url, comment, published, function(err){
+        if(err){ showSyncToast("保存に失敗しました：" + err, true); btn.removeAttribute("disabled"); btn.textContent = "保存する"; return; }
+        showSyncToast("保存しました。");
+        fetchFeaturedVideo(function(){ go("adminHome"); });
+      });
+    };
+  });
 }
 
 function renderStats(){
@@ -5037,6 +5339,9 @@ function render(){
     case "flashcardCreate": renderFlashcardCreate(); break;
     case "flashcardBulkImport": renderFlashcardBulkImport(); break;
     case "flashcardStudy": renderFlashcardStudy(); break;
+    case "adminHome": renderAdminHome(); break;
+    case "adminAnnouncementEdit": renderAdminAnnouncementEdit(); break;
+    case "adminVideoEdit": renderAdminVideoEdit(); break;
     case "category": renderCategory(); break;
     case "setup": renderSetup(); break;
     case "quiz": renderQuiz(); break;
@@ -5058,11 +5363,15 @@ function render(){
 
 // ---------- 起動処理：Supabaseのセッション復元 ----------
 function boot(){
+  function afterBaseData(cb){
+    fetchAnnouncements(function(){ fetchFeaturedVideo(function(){ cb(); }); });
+  }
   if(SUPABASE_ENABLED){
     sbClient.auth.onAuthStateChange(function(event, session){
       var newUser = session ? session.user : null;
       if(event === "SIGNED_OUT"){
         currentUser = null;
+        currentUserIsAdmin = false;
         return;
       }
       if(event === "SIGNED_IN" && (!currentUser || (newUser && currentUser.id !== newUser.id))){
@@ -5070,7 +5379,11 @@ function boot(){
         // Googleログインのリダイレクト帰りなど、まだアプリ側で処理していないログインを検知した場合に反映する
         if(state.screen === "login" || state.screen === "home"){
           migrateGuestDataToSupabase(function(){
-            pullUserDataFromSupabase(function(){ syncFlashcardsOnLogin(function(){ go("home"); }); });
+            pullUserDataFromSupabase(function(){
+              syncFlashcardsOnLogin(function(){
+                checkAdminStatus(function(){ go("home"); });
+              });
+            });
           });
         }
         return;
@@ -5081,11 +5394,15 @@ function boot(){
       var session = res && res.data ? res.data.session : null;
       currentUser = session ? session.user : null;
       if(currentUser){
-        pullUserDataFromSupabase(function(){ syncFlashcardsOnLogin(function(){ render(); }); });
+        pullUserDataFromSupabase(function(){
+          syncFlashcardsOnLogin(function(){
+            checkAdminStatus(function(){ afterBaseData(render); });
+          });
+        });
       } else {
-        render();
+        afterBaseData(render);
       }
-    }).catch(function(){ render(); });
+    }).catch(function(){ afterBaseData(render); });
   } else {
     render();
   }
