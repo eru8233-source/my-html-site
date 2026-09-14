@@ -1894,6 +1894,44 @@ function extractYoutubeId(url){
   return m ? m[1] : null;
 }
 
+// お知らせ本文中の [img]URL[/img] と [table]行|列...[/table] マーカーを実際の
+// 画像・表として描画する。それ以外の部分は通常のテキストとしてエスケープ表示する。
+function renderAnnouncementBody(text){
+  var html = "";
+  var re = /\[img\]([\s\S]*?)\[\/img\]|\[table\]([\s\S]*?)\[\/table\]/g;
+  var lastIndex = 0, m;
+  function pushText(t){
+    if(t === "") return;
+    html += '<div style="white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.7;">' + escapeHtml(t) + '</div>';
+  }
+  while((m = re.exec(text))){
+    pushText(text.slice(lastIndex, m.index));
+    if(m[1] !== undefined){
+      var url = m[1].trim();
+      if(/^https:\/\//.test(url)){
+        html += '<img src="' + escapeHtml(url) + '" alt="" style="max-width:100%;border-radius:10px;margin:8px 0;display:block;" loading="lazy">';
+      }
+    } else if(m[2] !== undefined){
+      var rows = m[2].replace(/^\n+|\n+$/g, "").split("\n").filter(function(r){ return r.length; }).map(function(r){ return r.split("|"); });
+      if(rows.length){
+        html += '<div style="overflow-x:auto;margin:8px 0;"><table class="material-table">';
+        rows.forEach(function(cells, ri){
+          html += "<tr>";
+          cells.forEach(function(c){
+            var tag = ri === 0 ? "th" : "td";
+            html += "<" + tag + ">" + escapeHtml(c.trim()) + "</" + tag + ">";
+          });
+          html += "</tr>";
+        });
+        html += "</table></div>";
+      }
+    }
+    lastIndex = re.lastIndex;
+  }
+  pushText(text.slice(lastIndex));
+  return html || '<div style="font-size:14px;">' + escapeHtml(text) + '</div>';
+}
+
 // ---- 管理者操作（すべてSupabase側のRLSでも管理者チェックされるため、なりすまし不可） ----
 function adminCreateAnnouncement(body, isPublished, onDone){
   if(!SUPABASE_ENABLED || !currentUserIsAdmin){ onDone("権限がありません。"); return; }
@@ -2743,7 +2781,7 @@ function renderHome(){
       '<div style="font-weight:700;margin-bottom:8px;">📢 管理人メモ</div>';
     announcementsList.slice(0, 5).forEach(function(a, idx){
       if(idx > 0) announceHtml += '<div style="border-top:1px dashed var(--line);margin:12px 0;"></div>';
-      announceHtml += '<div style="white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.7;">' + escapeHtml(a.body) + '</div>';
+      announceHtml += renderAnnouncementBody(a.body);
     });
     announceHtml += '</div>';
   }
@@ -3664,12 +3702,84 @@ function renderAdminAnnouncementEdit(){
       '<label style="font-size:13px;color:var(--sub);">本文（改行・絵文字OK）</label>' +
       '<textarea id="announce-body" rows="8" style="width:100%;padding:12px;border-radius:10px;border:2px solid var(--line);font-size:15px;font-family:inherit;margin-top:6px;white-space:pre-wrap;">' +
       escapeHtml(existing ? existing.body : "") + '</textarea>' +
+      '<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">' +
+      '<button class="btn ghost" id="b-insert-image" type="button" style="flex:1;min-width:140px;">📷 画像を追加</button>' +
+      '<button class="btn ghost" id="b-insert-table" type="button" style="flex:1;min-width:140px;">📊 表を挿入</button>' +
+      '</div>' +
+      '<input type="file" id="announce-image-input" accept="image/*" style="display:none;">' +
+      '<div id="image-upload-status" style="font-size:12px;color:var(--sub);margin-top:4px;"></div>' +
+      '<div id="table-builder-container"></div>' +
+      '<div class="note" style="margin-top:8px;">プレビューは保存後にホーム画面でご確認いただけます。</div>' +
       '<label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-size:14px;">' +
       '<input type="checkbox" id="announce-published" ' + (existing ? (existing.is_published?"checked":"") : "") + ' style="width:18px;height:18px;">公開する</label>' +
       '<button class="btn primary" id="b-announce-save" style="margin-top:14px;">保存する</button>' +
       '</div>';
     app.innerHTML = html;
     document.getElementById("back").onclick = function(){ go("adminHome"); };
+
+    document.getElementById("b-insert-image").onclick = function(){
+      document.getElementById("announce-image-input").click();
+    };
+    document.getElementById("announce-image-input").onchange = function(e){
+      var file = e.target.files && e.target.files[0];
+      if(!file) return;
+      var statusEl = document.getElementById("image-upload-status");
+      if(!SUPABASE_ENABLED || !currentUserIsAdmin){ statusEl.textContent = "画像アップロードにはログインが必要です。"; return; }
+      statusEl.textContent = "アップロード中…";
+      var safeName = file.name.replace(/[^a-zA-Z0-9_.\-]/g, "_");
+      var path = "announcements/" + Date.now() + "_" + safeName;
+      sbClient.storage.from("announcement-images").upload(path, file, {cacheControl:"3600", upsert:false})
+        .then(function(res){
+          if(res.error){ statusEl.textContent = "アップロード失敗：" + res.error.message; return; }
+          var pub = sbClient.storage.from("announcement-images").getPublicUrl(path);
+          var url = pub && pub.data ? pub.data.publicUrl : null;
+          if(!url){ statusEl.textContent = "画像URLの取得に失敗しました。"; return; }
+          var ta = document.getElementById("announce-body");
+          ta.value += (ta.value && !/\n$/.test(ta.value) ? "\n" : "") + "[img]" + url + "[/img]\n";
+          statusEl.textContent = "画像を追加しました。";
+        }).catch(function(err){ statusEl.textContent = "通信エラー：" + (err && err.message ? err.message : err); });
+    };
+
+    document.getElementById("b-insert-table").onclick = function(){
+      var rowsStr = prompt("行数を入力してください（1行目は見出しになります）", "3");
+      if(rowsStr === null) return;
+      var colsStr = prompt("列数を入力してください", "2");
+      if(colsStr === null) return;
+      var rows = parseInt(rowsStr, 10), cols = parseInt(colsStr, 10);
+      if(!rows || !cols || rows < 1 || cols < 1 || rows > 10 || cols > 6){
+        alert("行数は1〜10、列数は1〜6の範囲で指定してください。");
+        return;
+      }
+      var gridHtml = '<div style="margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:10px;">' +
+        '<div style="font-size:13px;color:var(--sub);margin-bottom:8px;">表の内容を入力してください（1行目は見出し）</div>';
+      for(var r=0;r<rows;r++){
+        gridHtml += '<div style="display:flex;gap:4px;margin-bottom:4px;">';
+        for(var c=0;c<cols;c++){
+          gridHtml += '<input type="text" class="tb-cell" data-r="' + r + '" data-c="' + c + '" style="flex:1;min-width:0;padding:6px;border:1px solid var(--line);border-radius:6px;font-size:13px;">';
+        }
+        gridHtml += '</div>';
+      }
+      gridHtml += '<button class="btn primary" id="b-table-confirm" type="button" style="margin-top:6px;">この内容を本文に挿入</button>' +
+        '<button class="btn ghost" id="b-table-cancel" type="button">キャンセル</button></div>';
+      var container = document.getElementById("table-builder-container");
+      container.innerHTML = gridHtml;
+      document.getElementById("b-table-cancel").onclick = function(){ container.innerHTML = ""; };
+      document.getElementById("b-table-confirm").onclick = function(){
+        var lines = [];
+        for(var rr=0; rr<rows; rr++){
+          var vals = [];
+          for(var cc=0; cc<cols; cc++){
+            var input = container.querySelector('.tb-cell[data-r="' + rr + '"][data-c="' + cc + '"]');
+            vals.push(input ? input.value.replace(/\|/g, "／").replace(/\n/g, " ") : "");
+          }
+          lines.push(vals.join("|"));
+        }
+        var ta = document.getElementById("announce-body");
+        ta.value += (ta.value && !/\n$/.test(ta.value) ? "\n" : "") + "[table]\n" + lines.join("\n") + "\n[/table]\n";
+        container.innerHTML = "";
+      };
+    };
+
     document.getElementById("b-announce-save").onclick = function(){
       var body = document.getElementById("announce-body").value;
       var published = document.getElementById("announce-published").checked;
