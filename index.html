@@ -1991,6 +1991,56 @@ function translateSupabaseError(err){
   return msg || "エラーが発生しました。";
 }
 
+// ============================================================
+// 問題の管理人編集（上書き差分方式）
+// ============================================================
+// 元の問題データ（QUESTIONS配列＝HTMLに静的に埋め込まれたデータ）は一切書き換えず、
+// Supabaseに保存された差分（question_edits）をアプリ起動時に上から重ねて適用する。
+var EDITABLE_QUESTION_FIELDS = ["category", "difficulty", "question", "resource", "options", "answer", "explanation", "choiceDetails"];
+
+function applyQuestionEditPatch(q, patch){
+  EDITABLE_QUESTION_FIELDS.forEach(function(f){
+    if(patch[f] !== undefined) q[f] = patch[f];
+  });
+  if(patch.difficulty !== undefined) q.setDifficulty = patch.difficulty; // 単独問題のみ整合（組問題は先頭小問基準のため別途要対応）
+}
+
+// 起動時：保存済みの編集差分をすべて取得し、該当する問題に適用する
+function fetchAndApplyQuestionEdits(onDone){
+  if(!SUPABASE_ENABLED){ onDone(); return; }
+  sbClient.from("question_edits").select("problem_source,question_id,patch")
+    .then(function(res){
+      if(res && res.error){ console.error("[問題編集] 取得エラー:", res.error); onDone(); return; }
+      (res && res.data || []).forEach(function(row){
+        var q = QUESTIONS.filter(function(x){ return x.id === row.question_id && (x.problemSource||"official") === row.problem_source; })[0];
+        if(q) applyQuestionEditPatch(q, row.patch);
+      });
+      onDone();
+    }).catch(function(err){ console.error("[問題編集] 通信エラー:", err); onDone(); });
+}
+
+// 保存：差分をアップサートし、変更前後を履歴に記録し、その場でQUESTIONSにも反映する
+function adminSaveQuestionEdit(q, newValues, onDone){
+  if(!SUPABASE_ENABLED || !currentUserIsAdmin){ onDone("権限がありません。"); return; }
+  var before = {};
+  EDITABLE_QUESTION_FIELDS.forEach(function(f){ before[f] = q[f]; });
+  var problemSource = q.problemSource || "official";
+
+  sbClient.from("question_edits").upsert({
+    problem_source: problemSource, question_id: q.id, patch: newValues,
+    edited_by: currentUserId(), edited_at: new Date().toISOString()
+  }, {onConflict:"problem_source,question_id"}).then(function(res){
+    if(res && res.error){ onDone(translateSupabaseError(res.error)); return; }
+    return sbClient.from("question_edit_history").insert({
+      problem_source: problemSource, question_id: q.id, before: before, after: newValues, edited_by: currentUserId()
+    });
+  }).then(function(res2){
+    if(res2 && res2.error){ console.error("[問題編集] 履歴保存エラー:", res2.error); }
+    applyQuestionEditPatch(q, newValues); // 画面にすぐ反映
+    onDone(null);
+  }).catch(function(err){ onDone(translateSupabaseError(err)); });
+}
+
 function translateAuthError(err){
   var msg = (err && err.message) || String(err || "");
   if(/already registered|already exists|User already registered/i.test(msg)) return "このメールアドレスは既に登録されています。";
@@ -2589,7 +2639,8 @@ var state = {
   pendingSourceLabel: null, pendingSourceCallback: null, // 旧問題/参考問題/すべて 選択待ち
   currentFlashcardFolder: null, flashcardEditFolder: null, flashcardStudy: null,
   showQuizAbortMenu: false, // 学習モードの「中断してトップへ」確認パネル表示中かどうか
-  adminEditAnnouncementId: null
+  adminEditAnnouncementId: null,
+  adminEditQuestionId: null, adminEditReturnScreen: null
 };
 
 var app = document.getElementById("app");
@@ -3270,7 +3321,7 @@ function renderAnswerBlock(q, ans, atype){
     html += '<div class="answer-line">正解：<b>' + letters(q.answer) + '. ' + renderOption(q, q.answer) + '</b></div>';
   }
   if(q.explanation){
-    html += '<div class="explain"><b>解説</b><br>' + escapeHtml(q.explanation) + '</div>';
+    html += '<div class="explain"><b>解説</b><br>' + renderAnnouncementBody(q.explanation) + '</div>';
   } else {
     html += '<div class="explain">解説データは現在登録されていません。</div>';
   }
@@ -3289,6 +3340,9 @@ function renderAnswerBlock(q, ans, atype){
     (weakActive ? "★ 苦手問題から削除" : "★ 苦手問題に登録") + '</button>';
   if(isFlashcardEligible(q)){
     html += '<button class="btn ghost" id="b-fc-add-from-q" style="border-color:#d9a441;">🗂 フラッシュカードに追加</button>';
+  }
+  if(currentUserIsAdmin){
+    html += '<button class="btn ghost" id="b-admin-edit-q" style="border-color:#7a5cc9;color:#7a5cc9;">✏️ 問題を編集（管理者）</button>';
   }
   html += '<button class="btn primary" id="b-next">' +
     (state.idx+1 < state.sessionIds.length ? "次の問題" : "結果を見る") + '</button>';
@@ -3310,6 +3364,14 @@ function bindAnswerBlockEvents(q, ans){
       var card = createFlashcardFromQuestion(q);
       if(card){ showSyncToast("フラッシュカードに追加しました：" + card.front + " → " + card.back); }
       renderQuiz();
+    };
+  }
+  var adminEditBtn = document.getElementById("b-admin-edit-q");
+  if(adminEditBtn){
+    adminEditBtn.onclick = function(){
+      state.adminEditQuestionId = q.id;
+      state.adminEditReturnScreen = "quiz";
+      go("adminQuestionEdit");
     };
   }
   document.getElementById("b-next").onclick = function(){
@@ -3839,6 +3901,215 @@ function renderAdminVideoEdit(){
       });
     };
   });
+}
+
+// ============================================================
+// 管理者画面：問題編集
+// ============================================================
+function renderAdminQuestionEdit(){
+  if(!guardAdminScreen()) return;
+  var q = byId(state.adminEditQuestionId);
+  if(!q){ go("home"); return; }
+  var hasUnderline = !!q.resourceParts;
+
+  var html = '<div class="backlink" id="back">← 戻る</div><h2>問題を編集</h2>';
+  html += '<div class="card">';
+  html += '<div style="font-size:13px;color:var(--sub);margin-bottom:12px;">問題ID：' + q.id +
+    '　問題ソース：' + (q.problemSource==="reference"?"参考問題":"旧問題") +
+    (q.questionSetId ? '　組問題：小問' + q.questionSetPosition + '/' + q.questionSetSize : '') + '</div>';
+
+  html += '<label style="font-size:13px;color:var(--sub);">カテゴリー</label>' +
+    '<input type="text" id="qe-category" value="' + escapeHtml(q.category) + '" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);font-size:14px;margin:4px 0 12px;">';
+
+  html += '<label style="font-size:13px;color:var(--sub);">難易度（1〜7）</label>' +
+    '<input type="number" id="qe-difficulty" min="1" max="7" value="' + q.difficulty + '" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);font-size:14px;margin:4px 0 12px;">';
+
+  html += '<label style="font-size:13px;color:var(--sub);">問題文（指示文）</label>' +
+    '<textarea id="qe-question" rows="3" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);font-size:14px;font-family:inherit;margin:4px 0 12px;">' + escapeHtml(q.question) + '</textarea>';
+
+  if(hasUnderline){
+    html += '<div class="note" style="margin-bottom:12px;">この問題は傍線部（下線）付きの資料のため、資料本文は今回は編集できません（下線位置が崩れるのを防ぐためです）。それ以外の項目は編集できます。</div>';
+  } else {
+    html += '<label style="font-size:13px;color:var(--sub);">資料本文（あれば）</label>' +
+      '<textarea id="qe-resource" rows="4" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);font-size:14px;font-family:inherit;margin:4px 0 12px;">' + escapeHtml(q.resource||"") + '</textarea>';
+    if(q.questionSetId){
+      html += '<div class="note" style="margin-bottom:12px;">この資料は組問題（同じ問題セット）の他の小問とも共有されています。保存すると、同じ資料を使う他の小問にも反映されます。</div>';
+    }
+  }
+
+  html += '<label style="font-size:13px;color:var(--sub);">選択肢（左のボタンで正解を選択）</label>';
+  q.options.forEach(function(opt,i){
+    html += '<div style="display:flex;align-items:center;gap:8px;margin:6px 0;">' +
+      '<input type="radio" name="qe-answer" value="' + i + '" ' + (q.answer===i?"checked":"") + ' style="width:18px;height:18px;flex-shrink:0;">' +
+      '<input type="text" class="qe-option" data-i="' + i + '" value="' + escapeHtml(opt) + '" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--line);font-size:14px;">' +
+      '</div>';
+  });
+
+  html += '<label style="font-size:13px;color:var(--sub);margin-top:8px;display:block;">解説</label>' +
+    '<textarea id="qe-explanation" rows="6" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);font-size:14px;font-family:inherit;margin:4px 0 8px;">' + escapeHtml(q.explanation||"") + '</textarea>' +
+    '<div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;">' +
+    '<button class="btn ghost" id="qe-insert-image" type="button" style="flex:1;min-width:140px;">📷 画像を追加</button>' +
+    '<button class="btn ghost" id="qe-insert-table" type="button" style="flex:1;min-width:140px;">📊 表を挿入</button>' +
+    '</div>' +
+    '<input type="file" id="qe-image-input" accept="image/*" style="display:none;">' +
+    '<div id="qe-image-status" style="font-size:12px;color:var(--sub);margin-bottom:8px;"></div>' +
+    '<div id="qe-table-builder"></div>';
+
+  html += '<label style="font-size:13px;color:var(--sub);margin-top:8px;display:block;">選択肢ごとの解説（任意）</label>';
+  q.options.forEach(function(opt,i){
+    var cd = q.choiceDetails ? q.choiceDetails[i] : null;
+    html += '<div style="margin:6px 0;"><div style="font-size:12px;color:var(--sub);">' + letters(i) + '.</div>' +
+      '<textarea class="qe-choicedetail" data-i="' + i + '" rows="2" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);font-size:13px;font-family:inherit;">' + escapeHtml(cd||"") + '</textarea></div>';
+  });
+
+  html += '<div id="qe-preview-area" style="margin-top:14px;"></div>';
+  html += '<button class="btn" id="qe-preview" style="margin-top:10px;">プレビュー</button>';
+  html += '<button class="btn primary" id="qe-save">保存する</button>';
+  html += '<button class="btn ghost" id="qe-cancel">キャンセル</button>';
+  html += '</div>';
+
+  app.innerHTML = html;
+  document.getElementById("back").onclick = function(){ go(state.adminEditReturnScreen || "home"); };
+  document.getElementById("qe-cancel").onclick = function(){ go(state.adminEditReturnScreen || "home"); };
+
+  document.getElementById("qe-insert-image").onclick = function(){
+    document.getElementById("qe-image-input").click();
+  };
+  document.getElementById("qe-image-input").onchange = function(e){
+    var file = e.target.files && e.target.files[0];
+    if(!file) return;
+    var statusEl = document.getElementById("qe-image-status");
+    if(!SUPABASE_ENABLED || !currentUserIsAdmin){ statusEl.textContent = "画像アップロードにはログインが必要です。"; return; }
+    statusEl.textContent = "アップロード中…";
+    var safeName = file.name.replace(/[^a-zA-Z0-9_.\-]/g, "_");
+    var path = "questions/" + Date.now() + "_" + safeName;
+    sbClient.storage.from("announcement-images").upload(path, file, {cacheControl:"3600", upsert:false})
+      .then(function(res){
+        if(res.error){ statusEl.textContent = "アップロード失敗：" + res.error.message; return; }
+        var pub = sbClient.storage.from("announcement-images").getPublicUrl(path);
+        var url = pub && pub.data ? pub.data.publicUrl : null;
+        if(!url){ statusEl.textContent = "画像URLの取得に失敗しました。"; return; }
+        var ta = document.getElementById("qe-explanation");
+        ta.value += (ta.value && !/\n$/.test(ta.value) ? "\n" : "") + "[img]" + url + "[/img]\n";
+        statusEl.textContent = "画像を追加しました。";
+      }).catch(function(err){ statusEl.textContent = "通信エラー：" + (err && err.message ? err.message : err); });
+  };
+
+  document.getElementById("qe-insert-table").onclick = function(){
+    var rowsStr = prompt("行数を入力してください（1行目は見出しになります）", "3");
+    if(rowsStr === null) return;
+    var colsStr = prompt("列数を入力してください", "2");
+    if(colsStr === null) return;
+    var rows = parseInt(rowsStr, 10), cols = parseInt(colsStr, 10);
+    if(!rows || !cols || rows < 1 || cols < 1 || rows > 10 || cols > 6){
+      alert("行数は1〜10、列数は1〜6の範囲で指定してください。");
+      return;
+    }
+    var gridHtml = '<div style="margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:10px;">' +
+      '<div style="font-size:13px;color:var(--sub);margin-bottom:8px;">表の内容を入力してください（1行目は見出し）</div>';
+    for(var r=0;r<rows;r++){
+      gridHtml += '<div style="display:flex;gap:4px;margin-bottom:4px;">';
+      for(var c=0;c<cols;c++){
+        gridHtml += '<input type="text" class="qtb-cell" data-r="' + r + '" data-c="' + c + '" style="flex:1;min-width:0;padding:6px;border:1px solid var(--line);border-radius:6px;font-size:13px;">';
+      }
+      gridHtml += '</div>';
+    }
+    gridHtml += '<button class="btn primary" id="qe-table-confirm" type="button" style="margin-top:6px;">この内容を解説に挿入</button>' +
+      '<button class="btn ghost" id="qe-table-cancel" type="button">キャンセル</button></div>';
+    var container = document.getElementById("qe-table-builder");
+    container.innerHTML = gridHtml;
+    document.getElementById("qe-table-cancel").onclick = function(){ container.innerHTML = ""; };
+    document.getElementById("qe-table-confirm").onclick = function(){
+      var lines = [];
+      for(var rr=0; rr<rows; rr++){
+        var vals = [];
+        for(var cc=0; cc<cols; cc++){
+          var input = container.querySelector('.qtb-cell[data-r="' + rr + '"][data-c="' + cc + '"]');
+          vals.push(input ? input.value.replace(/\|/g, "／").replace(/\n/g, " ") : "");
+        }
+        lines.push(vals.join("|"));
+      }
+      var ta = document.getElementById("qe-explanation");
+      ta.value += (ta.value && !/\n$/.test(ta.value) ? "\n" : "") + "[table]\n" + lines.join("\n") + "\n[/table]\n";
+      container.innerHTML = "";
+    };
+  };
+
+  function collectDraft(){
+    var options = Array.prototype.map.call(app.querySelectorAll(".qe-option"), function(el){ return el.value; });
+    var answerRadio = app.querySelector('input[name="qe-answer"]:checked');
+    var choiceDetails = Array.prototype.map.call(app.querySelectorAll(".qe-choicedetail"), function(el){ return el.value.trim() || null; });
+    var patch = {
+      category: document.getElementById("qe-category").value.trim(),
+      difficulty: Math.max(1, Math.min(7, parseInt(document.getElementById("qe-difficulty").value, 10) || q.difficulty)),
+      question: document.getElementById("qe-question").value,
+      options: options,
+      answer: answerRadio ? parseInt(answerRadio.value, 10) : q.answer,
+      explanation: document.getElementById("qe-explanation").value,
+      choiceDetails: choiceDetails.some(function(c){ return c; }) ? choiceDetails : null
+    };
+    if(!hasUnderline){
+      var resourceEl = document.getElementById("qe-resource");
+      patch.resource = resourceEl.value || null;
+    }
+    return patch;
+  }
+
+  document.getElementById("qe-preview").onclick = function(){
+    var draft = collectDraft();
+    var previewQ = Object.assign({}, q, draft);
+    var area = document.getElementById("qe-preview-area");
+    var pHtml = '<div class="card" style="border-color:var(--accent);background:#f4f8f8;">' +
+      '<div style="font-weight:700;margin-bottom:8px;color:var(--accent-dark);">プレビュー（実際のユーザー画面のイメージ）</div>' +
+      '<div class="qtext">' + escapeHtml(previewQ.question) + '</div>';
+    if(previewQ.resource){ pHtml += '<div class="resource">' + escapeHtml(previewQ.resource) + '</div>'; }
+    previewQ.options.forEach(function(opt, i){
+      pHtml += '<div class="opt' + (i===previewQ.answer ? ' correct' : '') + '" style="pointer-events:none;"><span class="label">' + letters(i) + '.</span> ' + escapeHtml(opt) + '</div>';
+    });
+    if(previewQ.explanation){ pHtml += '<div class="explain"><b>解説</b><br>' + renderAnnouncementBody(previewQ.explanation) + '</div>'; }
+    pHtml += '</div>';
+    area.innerHTML = pHtml;
+    area.scrollIntoView({behavior:"smooth", block:"nearest"});
+  };
+
+  document.getElementById("qe-save").onclick = function(){
+    var draft = collectDraft();
+    if(!draft.category || !draft.question || draft.options.some(function(o){ return !o.trim(); })){
+      alert("カテゴリー・問題文・すべての選択肢を入力してください。");
+      return;
+    }
+    var area = document.getElementById("qe-preview-area");
+    area.innerHTML = renderModalOverlay(
+      '<div style="font-weight:600;margin-bottom:8px;font-size:16px;">問題を更新しますか？</div>' +
+      '<div style="font-size:13px;color:var(--sub);margin-bottom:16px;">問題文・選択肢・正解・解説の変更内容を保存します。</div>' +
+      '<button class="btn primary" id="qe-confirm-save">保存する</button>' +
+      '<button class="btn ghost" id="qe-confirm-cancel">キャンセル</button>'
+    );
+    document.getElementById("qe-confirm-cancel").onclick = function(){ area.innerHTML = ""; };
+    document.getElementById("qe-confirm-save").onclick = function(){
+      var btn = document.getElementById("qe-confirm-save");
+      btn.setAttribute("disabled","disabled"); btn.textContent = "保存中…";
+
+      // 組問題で資料を共有している場合、資料の変更だけは他の小問にも反映する
+      var siblingResourcePatch = null;
+      if(!hasUnderline && q.questionSetId && draft.resource !== q.resource){
+        siblingResourcePatch = draft.resource;
+      }
+
+      adminSaveQuestionEdit(q, draft, function(err){
+        if(err){ area.innerHTML = ""; showSyncToast("保存に失敗しました：" + err, true); return; }
+        if(siblingResourcePatch !== null){
+          var siblings = QUESTIONS.filter(function(x){ return x.questionSetId === q.questionSetId && x.id !== q.id; });
+          siblings.forEach(function(sib){
+            adminSaveQuestionEdit(sib, {resource: siblingResourcePatch}, function(){});
+          });
+        }
+        showSyncToast("問題を更新しました。");
+        go(state.adminEditReturnScreen || "home");
+      });
+    };
+    area.scrollIntoView({behavior:"smooth", block:"start"});
+  };
 }
 
 function renderStats(){
@@ -5427,7 +5698,10 @@ function renderTestDetail(){
       });
     }
     html += '<div class="answer-line" style="margin-top:8px;">結果：<b>' + (r.correct?"正解":"不正解") + '</b></div>';
-    if(q.explanation){ html += '<div class="explain"><b>解説</b><br>' + escapeHtml(q.explanation) + '</div>'; }
+    if(q.explanation){ html += '<div class="explain"><b>解説</b><br>' + renderAnnouncementBody(q.explanation) + '</div>'; }
+    if(currentUserIsAdmin){
+      html += '<button class="btn ghost" data-admin-edit-q="' + q.id + '" style="border-color:#7a5cc9;color:#7a5cc9;margin-top:8px;">✏️ この問題を編集（管理者）</button>';
+    }
     if(qtype === "single" || qtype === "multi"){
       if(testDetailExpanded[r.order] === undefined){
         testDetailExpanded[r.order] = {};
@@ -5459,6 +5733,13 @@ function renderTestDetail(){
   app.innerHTML = html;
   document.getElementById("back").onclick = function(){ go("testResult"); };
   document.getElementById("b-back-result").onclick = function(){ go("testResult"); };
+  Array.prototype.forEach.call(app.querySelectorAll("[data-admin-edit-q]"), function(btn){
+    btn.onclick = function(){
+      state.adminEditQuestionId = parseInt(btn.getAttribute("data-admin-edit-q"), 10);
+      state.adminEditReturnScreen = "testDetail";
+      go("adminQuestionEdit");
+    };
+  });
 
   t.questionRecords.forEach(function(r){
     var q = byIdTest(r.questionId);
@@ -5491,6 +5772,7 @@ function render(){
     case "adminHome": renderAdminHome(); break;
     case "adminAnnouncementEdit": renderAdminAnnouncementEdit(); break;
     case "adminVideoEdit": renderAdminVideoEdit(); break;
+    case "adminQuestionEdit": renderAdminQuestionEdit(); break;
     case "category": renderCategory(); break;
     case "setup": renderSetup(); break;
     case "quiz": renderQuiz(); break;
@@ -5513,7 +5795,7 @@ function render(){
 // ---------- 起動処理：Supabaseのセッション復元 ----------
 function boot(){
   function afterBaseData(cb){
-    fetchAnnouncements(function(){ fetchFeaturedVideo(function(){ cb(); }); });
+    fetchAnnouncements(function(){ fetchFeaturedVideo(function(){ fetchAndApplyQuestionEdits(cb); }); });
   }
   if(SUPABASE_ENABLED){
     sbClient.auth.onAuthStateChange(function(event, session){
